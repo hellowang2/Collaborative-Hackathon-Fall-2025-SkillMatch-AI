@@ -4,6 +4,8 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
 import plotly.graph_objects as go
+import spacy
+from spacy.matcher import PhraseMatcher
 
 # --- 1. Database Definitions ---
 
@@ -131,32 +133,28 @@ Email: john.doe@email.com
 Experience:
 - Developed web applications using Python, JavaScript, and React.
 - Managed databases with SQL and MongoDB.
+- I have experience with sci-kit learn and node.js.
 - Interested in AI and currently learning TensorFlow.
 
 Skills:
 - Languages: Python, JavaScript, SQL
 - Frameworks: React, Node.js
 - DB: MongoDB
-- Other: matlab, cooking
+- Other: matlab, cooking, ms excel
 """
 
-# --- 1A. Data Normalization ---
-# This map translates common user misspellings or aliases 
-# into the standardized skill names in our database.
-NORMALIZATION_MAP = {
-    "node.js": "nodejs",
-    "sklearn": "scikit-learn",
-    "sci-kit learn": "scikit-learn",
-    "amazon web services": "aws",
-    "ms excel": "excel",
-    # (Add more aliases here as needed)
-}
+# --- 1A. Data Normalization (REMOVED) ---
+# The NORMALIZATION_MAP is no longer needed.
+# SpaCy's PhraseMatcher will handle synonyms and aliases.
 
 
 # --- 2. AI Core Model Initialization ---
 
+# --- 2.1. CountVectorizer (Encoder Role) ---
 # Initialize the CountVectorizer with the complete skill vocabulary.
 # 'binary=True' creates a one-hot-encoded vector (skill present/absent).
+# ROLE CHANGE: This is no longer the "extractor". It is now the "encoder"
+# that turns our *found* skills into the correct vector for cosine similarity.
 vectorizer = CountVectorizer(binary=True, vocabulary=SKILLS_DB)
 
 # Pre-compute the skill vectors for all jobs in the database.
@@ -167,6 +165,53 @@ job_vectors = vectorizer.fit_transform(job_skills_text)
 
 # Get all feature names (skill names) from the vectorizer for later use.
 all_skill_names = vectorizer.get_feature_names_out() 
+
+# --- 2.2. SpaCy (Extractor Role) ---
+# Load the small English model.
+# Note: You may need to run `python -m spacy download en_core_web_sm`
+try:
+    nlp = spacy.load("en_core_web_sm")
+except IOError:
+    st.error("SpaCy model 'en_core_web_sm' not found.")
+    st.error("Please run: python -m spacy download en_core_web_sm")
+    st.stop()
+
+# Initialize the PhraseMatcher.
+# attr='LOWER' makes matching case-insensitive.
+skill_matcher = PhraseMatcher(nlp.vocab, attr='LOWER')
+
+# Build the patterns for the PhraseMatcher.
+# This replaces the old NORMALIZATION_MAP.
+patterns = {}
+
+# 1. Add skills from the main SKILLS_DB
+for skill in SKILLS_DB:
+    patterns[skill] = [nlp.make_doc(skill)]
+
+# 2. Add synonyms and aliases
+# The key (e.g., "scikit-learn") is the *standardized* skill name.
+# The list contains all variations that should map to it.
+patterns["scikit-learn"].extend([
+    nlp.make_doc("sklearn"),
+    nlp.make_doc("sci-kit learn")
+])
+patterns["nodejs"].append(nlp.make_doc("node.js"))
+patterns["aws"].append(nlp.make_doc("amazon web services"))
+patterns["excel"].append(nlp.make_doc("ms excel"))
+patterns["gcp"].append(nlp.make_doc("google cloud platform"))
+patterns["ui"].extend([
+    nlp.make_doc("ui design"),
+    nlp.make_doc("user interface")
+])
+patterns["ux"].extend([
+    nlp.make_doc("ux design"),
+    nlp.make_doc("user experience")
+])
+
+# Add the patterns to the matcher
+for skill_id, pattern_list in patterns.items():
+    skill_matcher.add(skill_id, pattern_list)
+
 
 # --- 3. Helper Function for Skill Gap Analysis ---
 
@@ -315,22 +360,21 @@ if analyze_button:
             st.image("https://i.imgflip.com/1sl1m0.jpg", caption="Please enter *some* skills... (Meme)")
             st.stop() # Stop further execution
 
-        # --- 6.1. Skill Vectorization ---
+        # --- 6.1. Skill Extraction (with SpaCy) ---
         
-        # Apply normalization before vectorizing.
-        # First, convert all text to lowercase.
-        normalized_resume_text = resume_text.lower()
+        # 1. Process the resume text with SpaCy.
+        # This replaces all the manual .lower() and .replace() calls.
+        doc = nlp(resume_text)
         
-        # Loop through the map and replace all known aliases.
-        for user_alias, db_skill in NORMALIZATION_MAP.items():
-            normalized_resume_text = normalized_resume_text.replace(user_alias, db_skill)
-            
-        # Transform the *normalized* resume text into a skill vector.
-        user_vector = vectorizer.transform([normalized_resume_text])
+        # 2. Run the PhraseMatcher on the processed doc.
+        matches = skill_matcher(doc)
         
-        # Identify which skills were found.
-        user_skills_array = user_vector.toarray()[0]
-        user_found_skills = {all_skill_names[i] for i, v in enumerate(user_skills_array) if v > 0}
+        # 3. Extract the *standardized* skill names (the match_id).
+        # We use a set to automatically handle duplicates.
+        user_found_skills = set()
+        for match_id, start, end in matches:
+            skill_name = nlp.vocab.strings[match_id]
+            user_found_skills.add(skill_name)
         
         # --- 6.2. Skills Inventory & Radar Chart ---
         
@@ -350,6 +394,7 @@ if analyze_button:
             for category in categories:
                 category_skills = SKILLS_BY_CATEGORY[category]
                 total_in_category = len(category_skills)
+                # Use set intersection to find common skills
                 user_has_in_category = user_found_skills.intersection(category_skills)
                 
                 if total_in_category > 0:
@@ -375,7 +420,6 @@ if analyze_button:
             ))
 
             # Set chart height and font sizes directly in the Plotly layout
-            # to avoid the Streamlit 'config' deprecation warning.
             fig.update_layout(
                 height=550, # Set chart height here
                 polar=dict(
@@ -396,13 +440,22 @@ if analyze_button:
             )
             
             # Display the chart, stretching to the column width.
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
             
             st.divider()
 
             # --- 6.3. Job Match Calculation ---
             
-            # Calculate cosine similarity.
+            # CRITICAL STEP: Bridge SpaCy (Extractor) and CountVectorizer (Encoder)
+            # 1. Convert the set of found skills back into a single string.
+            found_skills_string = " ".join(user_found_skills)
+            
+            # 2. Use the *original* vectorizer to transform this string.
+            # This creates a 'user_vector' that has the exact same dimensions
+            # and vocabulary as the pre-computed 'job_vectors'.
+            user_vector = vectorizer.transform([found_skills_string])
+            
+            # 3. Calculate cosine similarity.
             similarity_scores = cosine_similarity(user_vector, job_vectors)
             
             st.subheader("Top Job Matches (Based on your skills)")
