@@ -3,4 +3,5 @@ scikit-learn
 pandas
 plotly
 spacy
-en-core-web-sm
+en_core_web_sm
+
