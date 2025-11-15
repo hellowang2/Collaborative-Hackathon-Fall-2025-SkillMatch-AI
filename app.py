@@ -259,7 +259,7 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("1. Paste Your Resume (Plain Text)")
-    resume_text = st.text_area("Résumé/CV Text", height=400, key="resume_input")
+    resume_text = st.text_area("Resume/CV Text", height=400, key="resume_input")
 
     st.header("2. Select Target Jobs (Optional)")
     target_jobs = st.multiselect(
@@ -389,3 +389,4 @@ if analyze_button:
                         if job != top_job_title: 
                             display_skill_gap_analysis(job, user_found_skills)
                             st.write("---")
+
